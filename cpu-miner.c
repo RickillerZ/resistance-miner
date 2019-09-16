@@ -1,7 +1,6 @@
 /*
  * Copyright 2010 Jeff Garzik
  * Copyright 2012-2017 pooler
- * Copyright 2018-2019 The Resistance developers
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the Free
@@ -39,62 +38,9 @@
 #include "compat.h"
 #include "miner.h"
 
-#include "random.h"
-
-#include "cpuinfo.h"
-#ifdef HAVE_CPUINFO
-static int have_cpuinfo;
-#endif
-
 #define PROGRAM_NAME		"minerd"
 #define LP_SCANTIME		60
 
-#ifdef __linux /* Linux specific policy and affinity management */
-#include <sched.h>
-static inline void drop_policy(void)
-{
-	struct sched_param param;
-	param.sched_priority = 0;
-
-#ifdef SCHED_IDLE
-	if (unlikely(sched_setscheduler(0, SCHED_IDLE, &param) == -1))
-#endif
-#ifdef SCHED_BATCH
-		sched_setscheduler(0, SCHED_BATCH, &param);
-#endif
-}
-
-static inline void affine_to_cpu(int id, int cpu)
-{
-	cpu_set_t set;
-
-	CPU_ZERO(&set);
-	CPU_SET(cpu, &set);
-	sched_setaffinity(0, sizeof(set), &set);
-}
-#elif defined(__FreeBSD__) /* FreeBSD specific policy and affinity management */
-#include <sys/cpuset.h>
-static inline void drop_policy(void)
-{
-}
-
-static inline void affine_to_cpu(int id, int cpu)
-{
-	cpuset_t set;
-	CPU_ZERO(&set);
-	CPU_SET(cpu, &set);
-	cpuset_setaffinity(CPU_LEVEL_WHICH, CPU_WHICH_TID, -1, sizeof(cpuset_t), &set);
-}
-#else
-static inline void drop_policy(void)
-{
-}
-
-static inline void affine_to_cpu(int id, int cpu)
-{
-}
-#endif
-		
 enum workio_commands {
 	WC_GET_WORK,
 	WC_SUBMIT_WORK,
@@ -109,11 +55,17 @@ struct workio_cmd {
 };
 
 enum algos {
-	ALGO_RES_YESPOWER_1_0
+	ALGO_YESCRYPT,
+	ALGO_YESPOWER,
+	ALGO_SCRYPT,		/* scrypt(1024,1,1) */
+	ALGO_SHA256D,		/* SHA-256d */
 };
 
 static const char *algo_names[] = {
-	[ALGO_RES_YESPOWER_1_0]	= "res-yespower-1.0"
+	[ALGO_YESCRYPT]		= "yescrypt",
+	[ALGO_YESPOWER]		= "yespower",
+	[ALGO_SCRYPT]		= "scrypt",
+	[ALGO_SHA256D]		= "sha256d",
 };
 
 bool opt_debug = false;
@@ -133,8 +85,11 @@ static int opt_retries = -1;
 static int opt_fail_pause = 30;
 int opt_timeout = 0;
 static int opt_scantime = 5;
-static enum algos opt_algo = ALGO_RES_YESPOWER_1_0;
+// static enum algos opt_algo = ALGO_YESCRYPT;
+static enum algos opt_algo = ALGO_YESPOWER;
+static int opt_scrypt_n = 1024;
 static int opt_n_threads;
+int64_t opt_affinity = -1L;
 static int num_processors;
 static char *rpc_url;
 static char *rpc_userpass;
@@ -174,7 +129,11 @@ static char const usage[] = "\
 Usage: " PROGRAM_NAME " [OPTIONS]\n\
 Options:\n\
   -a, --algo=ALGO       specify the algorithm to use\n\
-                          res-yespower-1.0 (default)\n\
+                          yespower  yespower 0.5 *default*\n\
+                          yescrypt  yescrypt\n\
+                          scrypt    scrypt(1024, 1, 1)\n\
+                          scrypt:N  scrypt(N, 1, 1)\n\
+                          sha256d   SHA-256d\n\
   -o, --url=URL         URL of mining server\n\
   -O, --userpass=U:P    username:password pair for mining server\n\
   -u, --user=USERNAME   username for mining server\n\
@@ -207,6 +166,7 @@ Options:\n\
   -B, --background      run the miner in the background\n"
 #endif
 "\
+      --cpu-affinity    set process affinity to cpu core(s), mask 0x3 for cores 0 and 1\n\
       --benchmark       run in offline benchmark mode\n\
   -c, --config=FILE     load a JSON-format configuration file\n\
   -V, --version         display version information and exit\n\
@@ -232,6 +192,7 @@ static struct option const options[] = {
 	{ "coinbase-addr", 1, NULL, 1013 },
 	{ "coinbase-sig", 1, NULL, 1015 },
 	{ "config", 1, NULL, 'c' },
+	{ "cpu-affinity", 1, NULL, 1020 },
 	{ "debug", 0, NULL, 'D' },
 	{ "help", 0, NULL, 'h' },
 	{ "no-gbt", 0, NULL, 1011 },
@@ -259,7 +220,7 @@ static struct option const options[] = {
 };
 
 struct work {
-	uint32_t data[35];
+	uint32_t data[32];
 	uint32_t target[8];
 
 	int height;
@@ -276,6 +237,54 @@ static time_t g_work_time;
 static pthread_mutex_t g_work_lock;
 static bool submit_old = false;
 static char *lp_id;
+
+#ifdef __linux /* Linux specific policy and affinity management */
+#include <sched.h>
+static inline void drop_policy(void)
+{
+	struct sched_param param;
+	param.sched_priority = 0;
+
+#ifdef SCHED_IDLE
+	if (unlikely(sched_setscheduler(0, SCHED_IDLE, &param) == -1))
+#endif
+#ifdef SCHED_BATCH
+		sched_setscheduler(0, SCHED_BATCH, &param);
+#endif
+}
+
+#ifdef __BIONIC__
+#define pthread_setaffinity_np(tid,sz,s) {} /* only do process affinity */
+#endif
+
+static void affine_to_cpu_mask(int id, unsigned long mask) {
+	cpu_set_t set;
+	CPU_ZERO(&set);
+	for (uint8_t i = 0; i < num_processors; i++) {
+		// cpu mask
+		if (mask & (1UL<<i)) { CPU_SET(i, &set); }
+	}
+	if (id == -1) {
+		// process affinity
+		sched_setaffinity(0, sizeof(&set), &set);
+	} else {
+		// thread only
+		pthread_setaffinity_np(thr_info[id].pth, sizeof(&set), &set);
+	}
+}
+
+#elif defined(WIN32) /* Windows */
+static inline void drop_policy(void) { }
+static void affine_to_cpu_mask(int id, unsigned long mask) {
+	if (id == -1)
+		SetProcessAffinityMask(GetCurrentProcess(), mask);
+	else
+		SetThreadAffinityMask(GetCurrentThread(), mask);
+}
+#else
+static inline void drop_policy(void) { }
+static void affine_to_cpu_mask(int id, unsigned long mask) { }
+#endif
 
 static inline void work_free(struct work *w)
 {
@@ -351,7 +360,6 @@ static bool gbt_work_decode(const json_t *val, struct work *work)
 	int i, n;
 	uint32_t version, curtime, bits;
 	uint32_t prevhash[8];
-	uint32_t finalhash[8];
 	uint32_t target[8];
 	int cbtx_size;
 	unsigned char *cbtx = NULL;
@@ -406,11 +414,6 @@ static bool gbt_work_decode(const json_t *val, struct work *work)
 
 	if (unlikely(!jobj_binary(val, "previousblockhash", prevhash, sizeof(prevhash)))) {
 		applog(LOG_ERR, "JSON invalid previousblockhash");
-		goto out;
-	}
-
-	if (unlikely(!jobj_binary(val, "finalsaplingroothash", finalhash, sizeof(finalhash)))) {
-		applog(LOG_ERR, "JSON invalid finalsaplingroothash");
 		goto out;
 	}
 
@@ -626,11 +629,11 @@ static bool gbt_work_decode(const json_t *val, struct work *work)
 		work->data[8 - i] = le32dec(prevhash + i);
 	for (i = 0; i < 8; i++)
 		work->data[9 + i] = be32dec((uint32_t *)merkle_tree[0] + i);
-	for (i = 0; i < 8; i++)
-		work->data[24 - i] = le32dec(finalhash + i);
-	work->data[25] = swab32(curtime);
-	work->data[26] = le32dec(&bits);
-	memset(work->data + 27, 0x00, 32); /* 256-bit nonce */
+	work->data[17] = swab32(curtime);
+	work->data[18] = le32dec(&bits);
+	memset(work->data + 19, 0x00, 52);
+	work->data[20] = 0x80000000;
+	work->data[31] = 0x00000280;
 
 	if (unlikely(!jobj_binary(val, "target", target, sizeof(target)))) {
 		applog(LOG_ERR, "JSON invalid target");
@@ -682,9 +685,9 @@ static void share_result(int result, const char *reason)
 		hashrate += thr_hashrates[i];
 	result ? accepted_count++ : rejected_count++;
 	pthread_mutex_unlock(&stats_lock);
-	
-	sprintf(s, hashrate >= 1e3 ? "%.0f" : "%.1f", hashrate);
-	applog(LOG_INFO, "accepted: %lu/%lu (%.2f%%), %s hash/s %s",
+
+	sprintf(s, hashrate >= 1e6 ? "%.0f" : "%.4f", 1e-3 * hashrate);
+	applog(LOG_INFO, "accepted: %lu/%lu (%.2f%%), %s kH/s %s",
 		   accepted_count,
 		   accepted_count + rejected_count,
 		   100. * accepted_count / (accepted_count + rejected_count),
@@ -711,13 +714,13 @@ static bool submit_upstream_work(CURL *curl, struct work *work)
 	}
 
 	if (have_stratum) {
-		unsigned char ntime[4], nonce[4];
+		uint32_t ntime, nonce;
 		char ntimestr[9], noncestr[9], *xnonce2str, *req;
 
-		le32enc(ntime, work->data[25]);
-		le32enc(nonce, work->data[27]);
-		bin2hex(ntimestr, ntime, 4);
-		bin2hex(noncestr, nonce, 4);
+		le32enc(&ntime, work->data[17]);
+		le32enc(&nonce, work->data[19]);
+		bin2hex(ntimestr, (const unsigned char *)(&ntime), 4);
+		bin2hex(noncestr, (const unsigned char *)(&nonce), 4);
 		xnonce2str = abin2hex(work->xnonce2, work->xnonce2_len);
 		req = malloc(256 + strlen(rpc_user) + strlen(work->job_id) + 2 * work->xnonce2_len);
 		sprintf(req,
@@ -736,20 +739,20 @@ static bool submit_upstream_work(CURL *curl, struct work *work)
 
 		for (i = 0; i < ARRAY_SIZE(work->data); i++)
 			be32enc(work->data + i, work->data[i]);
-		bin2hex(data_str, (unsigned char *)work->data, 140);
+		bin2hex(data_str, (unsigned char *)work->data, 80);
 		if (work->workid) {
 			char *params;
 			val = json_object();
 			json_object_set_new(val, "workid", json_string(work->workid));
 			params = json_dumps(val, 0);
 			json_decref(val);
-			req = malloc(128 + 2*140 + strlen(work->txs) + strlen(params));
+			req = malloc(128 + 2*80 + strlen(work->txs) + strlen(params));
 			sprintf(req,
 				"{\"method\": \"submitblock\", \"params\": [\"%s%s\", %s], \"id\":1}\r\n",
 				data_str, work->txs, params);
 			free(params);
 		} else {
-			req = malloc(128 + 2*140 + strlen(work->txs));
+			req = malloc(128 + 2*80 + strlen(work->txs));
 			sprintf(req,
 				"{\"method\": \"submitblock\", \"params\": [\"%s%s\"], \"id\":1}\r\n",
 				data_str, work->txs);
@@ -999,9 +1002,11 @@ static bool get_work(struct thr_info *thr, struct work *work)
 	struct work *work_heap;
 
 	if (opt_benchmark) {
-		memset(work->data, 0x55, 108);
-		work->data[25] = swab32(time(NULL));
-		memset(work->data + 27, 0x00, 32); /* 256-bit nonce */
+		memset(work->data, 0x55, 76);
+		work->data[17] = swab32(time(NULL));
+		memset(work->data + 19, 0x00, 52);
+		work->data[20] = 0x80000000;
+		work->data[31] = 0x00000280;
 		memset(work->target, 0x00, sizeof(work->target));
 		return true;
 	}
@@ -1035,7 +1040,7 @@ static bool get_work(struct thr_info *thr, struct work *work)
 static bool submit_work(struct thr_info *thr, const struct work *work_in)
 {
 	struct workio_cmd *wc;
-	
+
 	/* fill out work request message */
 	wc = calloc(1, sizeof(*wc));
 	if (!wc)
@@ -1079,114 +1084,37 @@ static void stratum_gen_work(struct stratum_ctx *sctx, struct work *work)
 		memcpy(merkle_root + 32, sctx->job.merkle[i], 32);
 		sha256d(merkle_root, merkle_root, 64);
 	}
-	
+
 	/* Increment extranonce2 */
 	for (i = 0; i < sctx->xnonce2_size && !++sctx->job.xnonce2[i]; i++);
 
 	/* Assemble block header */
-	memset(work->data, 0, sizeof(work->data));
+	memset(work->data, 0, 128);
 	work->data[0] = le32dec(sctx->job.version);
 	for (i = 0; i < 8; i++)
 		work->data[1 + i] = le32dec((uint32_t *)sctx->job.prevhash + i);
 	for (i = 0; i < 8; i++)
 		work->data[9 + i] = be32dec((uint32_t *)merkle_root + i);
-	for (i = 0; i < 8; i++)
-		work->data[17 + i] = le32dec((uint32_t *)sctx->job.finalhash + i);
-	work->data[25] = le32dec(sctx->job.ntime);
-	work->data[26] = le32dec(sctx->job.nbits);
+	work->data[17] = le32dec(sctx->job.ntime);
+	work->data[18] = le32dec(sctx->job.nbits);
+	work->data[20] = 0x80000000;
+	work->data[31] = 0x00000280;
 
 	pthread_mutex_unlock(&sctx->work_lock);
 
 	if (opt_debug) {
 		char *xnonce2str = abin2hex(work->xnonce2, work->xnonce2_len);
 		applog(LOG_DEBUG, "DEBUG: job_id='%s' extranonce2=%s ntime=%08x",
-		       work->job_id, xnonce2str, swab32(work->data[26]));
+		       work->job_id, xnonce2str, swab32(work->data[17]));
 		free(xnonce2str);
 	}
 
-	diff_to_target(work->target, sctx->job.diff / 65536.0);
-}
-
-static void init_thread_affinity(unsigned int thr_id)
-{
-#ifdef HAVE_CPUINFO
-	if (!have_cpuinfo)
-#endif
-	{
-		/* CPU affinity makes most sense if the number of threads is a
-		 * multiple of the number of CPUs */
-		if (num_processors > 1 && opt_n_threads % num_processors == 0) {
-			if (!opt_quiet)
-				applog(LOG_INFO, "Binding thread %u to logical CPU %u",
-				       thr_id, thr_id % num_processors);
-			affine_to_cpu(thr_id, thr_id % num_processors);
-		}
-
-		return;
-	}
-
-#ifdef HAVE_CPUINFO
-	static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
-	pthread_mutex_lock(&mutex);
-
-	/* Try to order threads by number (this is purely cosmetic) */
-	static unsigned int last_thr_id = -1;
-	unsigned int timeout = 10000;
-	while (thr_id != last_thr_id + 1 && --timeout) {
-		pthread_mutex_unlock(&mutex);
-		sched_yield();
-		pthread_mutex_lock(&mutex);
-	}
-	last_thr_id = thr_id;
-
-	static cpu_set_t cpus_inuse; /* zero-initialized */
-	uint32_t use_per_seq[CPUINFO_LOGICAL_MAX] = {};
-	uint32_t use_per_chip[CPUINFO_CHIP_MAX] = {};
-
-	if (cpuinfo.logical > CPU_SETSIZE)
-		cpuinfo.logical = CPU_SETSIZE;
-
-	uint32_t i;
-	for (i = 0; i < cpuinfo.logical; i++) {
-		if (!CPU_ISSET(i, &cpus_inuse))
-			continue;
-		use_per_seq[cpuinfo.log2phy[i].seq]++;
-		use_per_chip[cpuinfo.log2phy[i].chip]++;
-	}
-
-	uint32_t min_per_seq = UINT32_MAX, min_per_chip = UINT32_MAX;
-	uint32_t imin = UINT32_MAX;
-	for (i = 0; i < cpuinfo.logical; i++) {
-		if (CPU_ISSET(i, &cpus_inuse))
-			continue;
-		uint32_t cur_per_seq = use_per_seq[cpuinfo.log2phy[i].seq];
-		uint32_t cur_per_chip = use_per_chip[cpuinfo.log2phy[i].chip];
-		if (cur_per_seq < min_per_seq || (cur_per_seq == min_per_seq &&
-		    cur_per_chip < min_per_chip)) {
-			min_per_seq = cur_per_seq;
-			min_per_chip = cur_per_chip;
-			imin = i;
-		}
-	}
-
-	if (imin == UINT32_MAX)
-		return;
-
-	if (!opt_quiet)
-		applog(LOG_INFO, "Binding thread %u to logical CPU %u (chip %u, core %u)",
-		       thr_id, imin, cpuinfo.log2phy[imin].chip, cpuinfo.log2phy[imin].core);
-
-	cpu_set_t cpus;
-	CPU_ZERO(&cpus);
-	CPU_SET(imin, &cpus);
-	if (sched_setaffinity(0, sizeof(cpus), &cpus)) {
-		perror("sched_setaffinity");
-	} else {
-		CPU_SET(imin, &cpus_inuse);
-	}
-
-	pthread_mutex_unlock(&mutex);
-#endif
+	if (opt_algo == ALGO_SCRYPT || opt_algo == ALGO_YESCRYPT)
+		diff_to_target(work->target, sctx->job.diff / 65536.0);
+	else if (opt_algo == ALGO_YESPOWER)
+		diff_to_target(work->target, sctx->job.diff / 65536.0);
+	else
+		diff_to_target(work->target, sctx->job.diff);
 }
 
 static void *miner_thread(void *userdata)
@@ -1195,12 +1123,10 @@ static void *miner_thread(void *userdata)
 	int thr_id = mythr->id;
 	struct work work = {{0}};
 	uint32_t max_nonce;
-	uint32_t start_nonce = 0xffffffffU / opt_n_threads * thr_id;
 	uint32_t end_nonce = 0xffffffffU / opt_n_threads * (thr_id + 1) - 0x20;
+	unsigned char *scratchbuf = NULL;
 	char s[16];
 	int i;
-
-	init_thread_affinity(thr_id);
 
 	/* Set worker threads to nice 19 and then preferentially to SCHED_IDLE
 	 * and if that fails, then SCHED_BATCH. No need for this to be an
@@ -1210,13 +1136,42 @@ static void *miner_thread(void *userdata)
 		drop_policy();
 	}
 
-	unsigned long hashes_done = 0;
-	struct timeval tv_start = {};
+	/* Cpu thread affinity */
+	if (num_processors > 1) {
+		if (opt_affinity == -1 && opt_n_threads > 1) {
+			if (opt_debug)
+				applog(LOG_DEBUG, "Binding thread %d to cpu %d (mask %x)", thr_id,
+						thr_id % num_processors, (1 << (thr_id % num_processors)));
+			affine_to_cpu_mask(thr_id, 1UL << (thr_id % num_processors));
+		} else if (opt_affinity != -1L) {
+			if (opt_debug)
+				applog(LOG_DEBUG, "Binding thread %d to cpu mask %x", thr_id,
+						opt_affinity);
+			affine_to_cpu_mask(thr_id, (unsigned long)opt_affinity);
+		}
+	}
 
-	gettimeofday(&tv_start, NULL);
+	/* Cpu affinity only makes sense if the number of threads is a multiple
+	 * of the number of CPUs */
+	// if (num_processors > 1 && opt_n_threads % num_processors == 0) {
+	// 	if (!opt_quiet)
+	// 		applog(LOG_INFO, "Binding thread %d to cpu %d",
+	// 		       thr_id, thr_id % num_processors);
+	// 	affine_to_cpu(thr_id, thr_id % num_processors);
+	// }
+
+	if (opt_algo == ALGO_SCRYPT) {
+		scratchbuf = scrypt_buffer_alloc(opt_scrypt_n);
+		if (!scratchbuf) {
+			applog(LOG_ERR, "scrypt buffer allocation failed");
+			pthread_mutex_lock(&applog_lock);
+			exit(1);
+		}
+	}
 
 	while (1) {
-		struct timeval tv_end, diff;
+		unsigned long hashes_done;
+		struct timeval tv_start, tv_end, diff;
 		int64_t max64;
 		int rc;
 
@@ -1224,7 +1179,7 @@ static void *miner_thread(void *userdata)
 			while (time(NULL) >= g_work_time + 120)
 				sleep(1);
 			pthread_mutex_lock(&g_work_lock);
-			if (work.data[27] >= end_nonce && !memcmp(work.data, g_work.data, 108))
+			if (work.data[19] >= end_nonce && !memcmp(work.data, g_work.data, 76))
 				stratum_gen_work(&stratum, &g_work);
 		} else {
 			int min_scantime = have_longpoll ? LP_SCANTIME : opt_scantime;
@@ -1232,7 +1187,7 @@ static void *miner_thread(void *userdata)
 			pthread_mutex_lock(&g_work_lock);
 			if (!have_stratum &&
 			    (time(NULL) - g_work_time >= min_scantime ||
-			     work.data[27] >= end_nonce)) {
+			     work.data[19] >= end_nonce)) {
 				work_free(&g_work);
 				if (unlikely(!get_work(mythr, &g_work))) {
 					applog(LOG_ERR, "work retrieval failed, exiting "
@@ -1247,19 +1202,15 @@ static void *miner_thread(void *userdata)
 				continue;
 			}
 		}
-		if (memcmp(work.data, g_work.data, 108)) {
+		if (memcmp(work.data, g_work.data, 76)) {
 			work_free(&work);
 			work_copy(&work, &g_work);
-			work.data[27] = start_nonce;
-			/* dare to leak this if random pool is uninitialized */
-			uint32_t seed = tv_start.tv_sec ^ tv_start.tv_usec ^ hashes_done;
-			/* the rest of 256-bit nonce */
-			memcpy(work.data + 28, random_get(&seed, sizeof(seed)), 28);
+			work.data[19] = 0xffffffffU / opt_n_threads * thr_id;
 		} else
-			work.data[27]++;
+			work.data[19]++;
 		pthread_mutex_unlock(&g_work_lock);
 		work_restart[thr_id].restart = 0;
-		
+
 		/* adjust max_nonce to meet target scan time */
 		if (have_stratum)
 			max64 = LP_SCANTIME;
@@ -1269,24 +1220,47 @@ static void *miner_thread(void *userdata)
 		max64 *= thr_hashrates[thr_id];
 		if (max64 <= 0) {
 			switch (opt_algo) {
-			case ALGO_RES_YESPOWER_1_0:
-				max64 = 499;
+			case ALGO_YESCRYPT:
+				max64 = 0x000fff;
+				break;
+			case ALGO_YESPOWER:
+				max64 = 0x000fff;
+				break;
+			case ALGO_SCRYPT:
+				max64 = opt_scrypt_n < 16 ? 0x3ffff : 0x3fffff / opt_scrypt_n;
+				break;
+			case ALGO_SHA256D:
+				max64 = 0x1fffff;
 				break;
 			}
 		}
-		if (work.data[27] + max64 > end_nonce)
+		if (work.data[19] + max64 > end_nonce)
 			max_nonce = end_nonce;
 		else
-			max_nonce = work.data[27] + max64;
-		
+			max_nonce = work.data[19] + max64;
+
 		hashes_done = 0;
 		gettimeofday(&tv_start, NULL);
 
 		/* scan nonces for a proof-of-work hash */
 		switch (opt_algo) {
-		case ALGO_RES_YESPOWER_1_0:
-			rc = scanhash_res_yespower(thr_id, work.data, work.target,
-			                     max_nonce, &hashes_done);
+		case ALGO_YESCRYPT:
+			rc = scanhash_yescrypt(thr_id, work.data, work.target,
+					       max_nonce, &hashes_done);
+			break;
+		case ALGO_YESPOWER:
+			rc = scanhash_yespower(thr_id, work.data, work.target,
+					       max_nonce, &hashes_done);
+			break;
+
+		case ALGO_SCRYPT:
+			rc = scanhash_scrypt(thr_id, work.data, scratchbuf, work.target,
+			                     max_nonce, &hashes_done, opt_scrypt_n);
+			break;
+
+		case ALGO_SHA256D:
+			rc = scanhash_sha256d(thr_id, work.data, work.target,
+			                      max_nonce, &hashes_done);
 			break;
 
 		default:
@@ -1304,20 +1278,18 @@ static void *miner_thread(void *userdata)
 			pthread_mutex_unlock(&stats_lock);
 		}
 		if (!opt_quiet) {
-			sprintf(s, thr_hashrates[thr_id] >= 1e3 ? "%.0f" : "%.1f",
-				thr_hashrates[thr_id]);
-			applog(LOG_INFO, "thread %d: %lu hashes, %s hash/s",
+			sprintf(s, thr_hashrates[thr_id] >= 1e6 ? "%.0f" : "%.4f",
+				1e-3 * thr_hashrates[thr_id]);
+			applog(LOG_INFO, "thread %d: %lu hashes, %s kH/s",
 				thr_id, hashes_done, s);
 		}
 		if (opt_benchmark && thr_id == opt_n_threads - 1) {
 			double hashrate = 0.;
-			pthread_mutex_lock(&stats_lock);
 			for (i = 0; i < opt_n_threads && thr_hashrates[i]; i++)
 				hashrate += thr_hashrates[i];
-			pthread_mutex_unlock(&stats_lock);
 			if (i == opt_n_threads) {
-				sprintf(s, hashrate >= 1e3 ? "%.0f" : "%.1f", hashrate);
-				applog(LOG_INFO, "Total: %s hash/s", s);
+				sprintf(s, hashrate >= 1e6 ? "%.0f" : "%.4f", 1e-3 * hashrate);
+				applog(LOG_INFO, "Total: %s kH/s", s);
 			}
 		}
 
@@ -1363,7 +1335,7 @@ start:
 		lp_url = hdr_path;
 		hdr_path = NULL;
 	}
-	
+
 	/* absolute path, on current server */
 	else {
 		copy_start = (*hdr_path == '/') ? (hdr_path + 1) : hdr_path;
@@ -1517,7 +1489,7 @@ static void *stratum_thread(void *userdata)
 				restart_threads();
 			}
 		}
-		
+
 		if (!stratum_socket_full(&stratum, 120)) {
 			applog(LOG_ERR, "Stratum connection timed out");
 			s = NULL;
@@ -1540,26 +1512,57 @@ out:
 static void show_version_and_exit(void)
 {
 	printf(PACKAGE_STRING "\n built on " __DATE__ "\n features:"
-#if defined(__i386__) || defined(__x86_64__)
-#ifdef __x86_64__
-		" x86_64"
-#else
+#if defined(USE_ASM) && defined(__i386__)
 		" i386"
 #endif
-#ifdef __SSE2__
+#if defined(USE_ASM) && defined(__x86_64__)
+		" x86_64"
+		" PHE"
+#endif
+#if defined(USE_ASM) && (defined(__i386__) || defined(__x86_64__))
 		" SSE2"
 #endif
-#ifdef __SSE4_1__
-		" SSE4.1"
-#endif
-#ifdef __AVX__
+#if defined(__x86_64__) && defined(USE_AVX)
 		" AVX"
 #endif
-#ifdef __XOP__
+#if defined(__x86_64__) && defined(USE_AVX2)
+		" AVX2"
+#endif
+#if defined(__x86_64__) && defined(USE_XOP)
 		" XOP"
 #endif
-#else
-		" generic"
+#if defined(USE_ASM) && defined(__arm__) && defined(__APCS_32__)
+		" ARM"
+#if defined(__ARM_ARCH_5E__) || defined(__ARM_ARCH_5TE__) || \
+	defined(__ARM_ARCH_5TEJ__) || defined(__ARM_ARCH_6__) || \
+	defined(__ARM_ARCH_6J__) || defined(__ARM_ARCH_6K__) || \
+	defined(__ARM_ARCH_6M__) || defined(__ARM_ARCH_6T2__) || \
+	defined(__ARM_ARCH_6Z__) || defined(__ARM_ARCH_6ZK__) || \
+	defined(__ARM_ARCH_7__) || \
+	defined(__ARM_ARCH_7A__) || defined(__ARM_ARCH_7R__) || \
+	defined(__ARM_ARCH_7M__) || defined(__ARM_ARCH_7EM__)
+		" ARMv5E"
+#endif
+#if defined(__ARM_NEON__)
+		" NEON"
+#endif
+#endif
+
+#if defined(USE_ASM) && defined(__aarch64__)
+		" AArch64"
+#if defined(__ARM_ARCH_8A)
+		" ARMv8A"
+#endif
+#if defined(__ARM_NEON)
+		" AdvancedSIMD"
+#endif
+#endif
+
+#if defined(USE_ASM) && (defined(__powerpc__) || defined(__ppc__) || defined(__PPC__))
+		" PowerPC"
+#if defined(__ALTIVEC__)
+		" AltiVec"
+#endif
 #endif
 		"\n");
 
@@ -1591,6 +1594,7 @@ static void parse_arg(int key, char *arg, char *pname)
 {
 	char *p;
 	int v, i;
+	uint64_t ul;
 
 	switch(key) {
 	case 'a':
@@ -1599,6 +1603,15 @@ static void parse_arg(int key, char *arg, char *pname)
 			if (!strncmp(arg, algo_names[i], v)) {
 				if (arg[v] == '\0') {
 					opt_algo = i;
+					break;
+				}
+				if (arg[v] == ':' && i == ALGO_SCRYPT) {
+					char *ep;
+					v = strtol(arg+v+1, &ep, 10);
+					if (*ep || v & (v-1) || v < 2)
+						continue;
+					opt_algo = i;
+					opt_scrypt_n = v;
 					break;
 				}
 			}
@@ -1800,6 +1813,16 @@ static void parse_arg(int key, char *arg, char *pname)
 		}
 		strcpy(coinbase_sig, arg);
 		break;
+	case 1020:
+		p = strstr(arg, "0x");
+		if (p)
+			ul = strtoul(p, NULL, 16);
+		else
+			ul = atol(arg);
+		if (ul > (1UL<<num_processors)-1)
+			ul = -1;
+		opt_affinity = ul;
+		break;
 	case 'S':
 		use_syslog = true;
 		break;
@@ -1888,17 +1911,48 @@ static void signal_handler(int sig)
 }
 #endif
 
+static void show_credits()
+{
+	printf("** " PACKAGE_NAME " " PACKAGE_VERSION " by macchky@github **\n");
+	printf("ZNY donation address: Zq83XMtc9gShkgi4bNNHWA4FDbMe8dFQmD (macchky)\n");
+	printf("** yespower 0.5 support by cryptozeny@github **\n");
+	printf("ZNY donation address: ZyWJL5qp3qZQW85HVoT3ba2feJYsZ7aQ2v (cryptozeny)\n\n");
+}
+
 int main(int argc, char *argv[])
 {
 	struct thr_info *thr;
 	long flags;
 	int i;
 
+	show_credits();
+
 	rpc_user = strdup("");
 	rpc_pass = strdup("");
 
+#if defined(WIN32)
+	SYSTEM_INFO sysinfo;
+	GetSystemInfo(&sysinfo);
+	num_processors = sysinfo.dwNumberOfProcessors;
+#elif defined(_SC_NPROCESSORS_CONF)
+	num_processors = sysconf(_SC_NPROCESSORS_CONF);
+#elif defined(CTL_HW) && defined(HW_NCPU)
+	int req[] = { CTL_HW, HW_NCPU };
+	size_t len = sizeof(num_processors);
+	sysctl(req, 2, &num_processors, &len, NULL, 0);
+#else
+	num_processors = 1;
+#endif
+	if (num_processors < 1)
+		num_processors = 1;
+
 	/* parse command line */
 	parse_cmdline(argc, argv);
+
+	if (!opt_n_threads)
+		opt_n_threads = num_processors;
+	if (!opt_n_threads)
+		opt_n_threads = 1;
 
 	if (!opt_benchmark && !rpc_url) {
 		fprintf(stderr, "%s: no URL supplied\n", argv[0]);
@@ -1944,31 +1998,11 @@ int main(int argc, char *argv[])
 	}
 #endif
 
-#if defined(WIN32)
-	SYSTEM_INFO sysinfo;
-	GetSystemInfo(&sysinfo);
-	num_processors = sysinfo.dwNumberOfProcessors;
-#elif defined(_SC_NPROCESSORS_CONF)
-	num_processors = sysconf(_SC_NPROCESSORS_CONF);
-#elif defined(CTL_HW) && defined(HW_NCPU)
-	int req[] = { CTL_HW, HW_NCPU };
-	size_t len = sizeof(num_processors);
-	sysctl(req, 2, &num_processors, &len, NULL, 0);
-#else
-	num_processors = 1;
-#endif
-	if (num_processors < 1)
-		num_processors = 1;
-
-#ifdef HAVE_CPUINFO
-	have_cpuinfo = !cpuinfo_init();
-
-	if (!opt_n_threads && have_cpuinfo)
-		opt_n_threads = cpuinfo.physical;
-#endif
-
-	if (!opt_n_threads)
-		opt_n_threads = num_processors;
+	if (opt_affinity != -1) {
+		if (!opt_quiet)
+			applog(LOG_DEBUG, "Binding process to cpu mask %x", opt_affinity);
+		affine_to_cpu_mask(-1, (unsigned long)opt_affinity);
+	}
 
 #ifdef HAVE_SYSLOG_H
 	if (use_syslog)
@@ -1982,7 +2016,7 @@ int main(int argc, char *argv[])
 	thr_info = calloc(opt_n_threads + 3, sizeof(*thr));
 	if (!thr_info)
 		return 1;
-	
+
 	thr_hashrates = (double *) calloc(opt_n_threads, sizeof(double));
 	if (!thr_hashrates)
 		return 1;
@@ -2035,11 +2069,6 @@ int main(int argc, char *argv[])
 			tq_push(thr_info[stratum_thr_id].q, strdup(rpc_url));
 	}
 
-/* Only try /dev/urandom on Unix-like systems */
-#ifdef __unix__
-	random_init();
-#endif
-
 	/* start mining threads */
 	for (i = 0; i < opt_n_threads; i++) {
 		thr = &thr_info[i];
@@ -2054,10 +2083,6 @@ int main(int argc, char *argv[])
 			return 1;
 		}
 	}
-
-	/* Give the threads a chance to print their messages first */
-	if (!opt_quiet)
-		sleep(1);
 
 	applog(LOG_INFO, "%d miner threads started, "
 		"using '%s' algorithm.",
